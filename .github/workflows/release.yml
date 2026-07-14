@@ -1,0 +1,34 @@
+# Runs only when libLogin.so or Injector changes; publishes a date-tagged (ddmmyy) release, replacing same-name assets on same-day re-runs.
+name: Publish release
+
+on:
+  push:
+    branches: [main, master]
+    paths:
+      - libLogin.so
+      - Injector
+
+permissions:
+  contents: write
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Compute date tag
+        id: date
+        run: echo "tag=$(date +'%d%m%y')" >> "$GITHUB_OUTPUT"
+
+      - name: Publish libLogin.so + Injector to dated release
+        uses: softprops/action-gh-release@v3
+        with:
+          tag_name: ${{ steps.date.outputs.tag }}
+          name: ${{ steps.date.outputs.tag }}
+          make_latest: "true"
+          fail_on_unmatched_files: true
+          files: |
+            libLogin.so
+            Injector
