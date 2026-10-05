@@ -1,34 +1,132 @@
-# Runs only when libLogin.so or Injector changes; publishes a date-tagged (ddmmyy) release, replacing same-name assets on same-day re-runs.
+# Manual release: validates the version, checks the committed prebuilt binaries, signs libloader.so,
+# then creates a draft release at this commit and publishes it only once every asset is uploaded.
+# Never runs automatically. Native-update clients read the manifest from the "latest" release.
 name: Publish release
 
 on:
-  push:
-    branches: [main, master]
-    paths:
-      - libLogin.so
-      - Injector
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Release version, exactly as the tag/title, e.g. 2.3 or v2.3.1 (MAJOR.MINOR[.PATCH])"
+        required: true
+        type: string
+
+concurrency:
+  group: wr-release
+  cancel-in-progress: false
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
   publish:
     runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: write
     steps:
       - name: Checkout
         uses: actions/checkout@v4
-
-      - name: Compute date tag
-        id: date
-        run: echo "tag=$(date +'%d%m%y')" >> "$GITHUB_OUTPUT"
-
-      - name: Publish libLogin.so + Injector to dated release
-        uses: softprops/action-gh-release@v3
         with:
-          tag_name: ${{ steps.date.outputs.tag }}
-          name: ${{ steps.date.outputs.tag }}
-          make_latest: "true"
-          fail_on_unmatched_files: true
-          files: |
-            libLogin.so
-            Injector
+          persist-credentials: false
+
+      - name: Validate version
+        id: version
+        env:
+          VERSION_INPUT: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          python3 .github/scripts/release_preflight.py validate
+          echo "::warning title=AUTH_VER::The committed binaries are not rebuilt here. Make sure their embedded AUTH_VER matches this version before publishing."
+
+      - name: Check and stage prebuilt binaries
+        run: |
+          set -euo pipefail
+          python3 .github/scripts/release_preflight.py check-binaries --root . --stage-dir "$RUNNER_TEMP/release-assets"
+
+      - name: Check remote tag, release and version order
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.version.outputs.tag }}
+          SEQUENCE: ${{ steps.version.outputs.sequence }}
+        run: |
+          set -euo pipefail
+          python3 .github/scripts/release_preflight.py check-remote
+
+      - name: Sign libloader.so
+        env:
+          NATIVE_UPDATE_PRIVATE_KEY_PEM: ${{ secrets.NATIVE_UPDATE_PRIVATE_KEY_PEM }}
+          TAG: ${{ steps.version.outputs.tag }}
+          SEQUENCE: ${{ steps.version.outputs.sequence }}
+        run: |
+          set -euo pipefail
+          key_dir="$RUNNER_TEMP/native-key"
+          trap 'rm -rf -- "$key_dir"' EXIT
+          python3 .github/scripts/release_preflight.py write-key --dir "$key_dir"
+          unset NATIVE_UPDATE_PRIVATE_KEY_PEM
+          python3 .github/scripts/create-native-update.py \
+            --library "$RUNNER_TEMP/release-assets/libloader.so" \
+            --sequence "$SEQUENCE" \
+            --url "https://github.com/${GITHUB_REPOSITORY}/releases/download/${TAG}/libloader.so" \
+            --private-key "$key_dir/private.pem" \
+            --output-dir "$RUNNER_TEMP/native-package" \
+            --min-sdk 28
+
+      - name: Verify signed package against the pinned public key
+        env:
+          NATIVE_UPDATE_PUBLIC_KEY: ${{ vars.NATIVE_UPDATE_PUBLIC_KEY }}
+          TAG: ${{ steps.version.outputs.tag }}
+          SEQUENCE: ${{ steps.version.outputs.sequence }}
+        run: |
+          set -euo pipefail
+          python3 .github/scripts/release_preflight.py verify-package \
+            --package-dir "$RUNNER_TEMP/native-package" \
+            --expected-sequence "$SEQUENCE" \
+            --expected-url "https://github.com/${GITHUB_REPOSITORY}/releases/download/${TAG}/libloader.so"
+
+      - name: Create draft release with all assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.version.outputs.tag }}
+        run: |
+          set -euo pipefail
+          stage="$RUNNER_TEMP/release-assets"
+          pkg="$RUNNER_TEMP/native-package"
+          python3 .github/scripts/release_preflight.py notes \
+            --output "$RUNNER_TEMP/release-notes.md" \
+            --asset "$stage/libLogin.so" --asset "$stage/Injector" \
+            --asset "$pkg/libloader.so" --asset "$pkg/native-manifest.txt" --asset "$pkg/public-key.txt"
+          gh release create "$TAG" \
+            --repo "$GITHUB_REPOSITORY" \
+            --draft \
+            --target "$GITHUB_SHA" \
+            --title "$TAG" \
+            --notes-file "$RUNNER_TEMP/release-notes.md" \
+            "$stage/libLogin.so" "$stage/Injector" \
+            "$pkg/libloader.so" "$pkg/native-manifest.txt" "$pkg/public-key.txt"
+
+      - name: Verify draft assets
+        id: draft
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.version.outputs.tag }}
+        run: |
+          set -euo pipefail
+          stage="$RUNNER_TEMP/release-assets"
+          pkg="$RUNNER_TEMP/native-package"
+          python3 .github/scripts/release_preflight.py verify-draft \
+            --asset "$stage/libLogin.so" --asset "$stage/Injector" \
+            --asset "$pkg/libloader.so" --asset "$pkg/native-manifest.txt" --asset "$pkg/public-key.txt"
+
+      - name: Publish release as latest
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_ID: ${{ steps.draft.outputs.release_id }}
+        run: |
+          set -euo pipefail
+          gh api --method PATCH "repos/${GITHUB_REPOSITORY}/releases/${RELEASE_ID}" \
+            -F draft=false -f make_latest=true --silent
+
+      - name: Remove signing key
+        if: always()
+        run: rm -rf -- "$RUNNER_TEMP/native-key"
