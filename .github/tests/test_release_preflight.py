@@ -537,7 +537,7 @@ class WorkflowTests(unittest.TestCase):
         self.assertRegex(self.text, r"VERSION_INPUT: \$\{\{ inputs\.version \}\}")
 
     def test_secret_scoped_to_signing_step(self):
-        self.assertEqual(self.text.count("secrets."), 1)
+        self.assertEqual(self.text.count("secrets.NATIVE_UPDATE_PRIVATE_KEY_PEM"), 1)
         step = self.text.split("- name: Sign libloader.so")[1].split("\n      - name:")[0]
         self.assertIn("secrets.NATIVE_UPDATE_PRIVATE_KEY_PEM", step)
         self.assertIn("unset NATIVE_UPDATE_PRIVATE_KEY_PEM", step)
@@ -548,7 +548,9 @@ class WorkflowTests(unittest.TestCase):
 
     def test_signing_uses_vendored_publisher_with_contract_arguments(self):
         for fragment in ("python3 .github/scripts/create-native-update.py", '--sequence "$SEQUENCE"',
-                         'releases/download/${TAG}/libloader.so"', '--output-dir "$RUNNER_TEMP/native-package"',
+                         '--output-dir "$RUNNER_TEMP/native-package"',
+                         '--url "${R2_PUBLIC_URL%/}/native/${TAG}/libloader.so"',
+                         '--expected-url "${R2_PUBLIC_URL%/}/native/${TAG}/libloader.so"',
                          "--min-sdk 28"):
             self.assertIn(fragment, self.text)
 
@@ -558,7 +560,10 @@ class WorkflowTests(unittest.TestCase):
         self.assertLess(self.text.index("check-remote"), self.text.index("Sign libloader.so"))
         self.assertLess(self.text.index("verify-package"), create)
         self.assertLess(create, self.text.index("verify-draft"))
-        self.assertLess(self.text.index("verify-draft"), publish)
+        self.assertLess(self.text.index("verify-draft"), self.text.index("Upload native update to R2"))
+        self.assertLess(self.text.index("Upload native update to R2"), publish)
+        # the header comment also names the latest manifest, so look for the go-live write after publishing
+        self.assertGreater(self.text.index("native/latest/native-manifest.txt", publish), publish)
         self.assertIn("--draft", self.text)
         self.assertIn('--target "$GITHUB_SHA"', self.text)
         self.assertIn('--title "$TAG"', self.text)
